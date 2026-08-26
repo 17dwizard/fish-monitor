@@ -40,7 +40,7 @@ pip install pystray Pillow
 
 For real-time US overnight data (optional):
 ```bash
-pip install longport
+pip install longbridge
 ```
 
 ### 3. Run
@@ -82,7 +82,7 @@ README.md          — This file
 
 For real-time US overnight/pre/post market data:
 
-1. Get API credentials from [open.longportapp.com](https://open.longportapp.com/)
+1. Get API credentials from [open.longbridge.com](https://open.longbridge.com/)
 2. Right-click → Settings → Longbridge API
 3. Fill in App Key, Secret, and Access Token
 

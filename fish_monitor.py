@@ -110,7 +110,6 @@ def _sina_fetch(codes: list[str]) -> dict:
                     if ah_price and ah_pct is not None:
                         extra["ah_price"] = ah_price
                         extra["ah_pct"] = ah_pct
-                        extra["ah_time"] = values[24] if len(values) > 24 else ""
                     if pm_price and prev_close:
                         extra["pm_price"] = pm_price
                         extra["pm_pct"] = (pm_price - prev_close) / prev_close * 100
@@ -215,6 +214,37 @@ def fetch_quotes(codes: list[str]) -> dict:
 _longport_ctx = None
 
 
+def _detect_proxy():
+    """Detect local proxy (Clash, V2Ray, etc.) and set env vars."""
+    import socket
+    common_proxies = [
+        ("http://127.0.0.1:7890", 7890),   # Clash default
+        ("http://127.0.0.1:7897", 7897),   # Clash alternative
+        ("http://127.0.0.1:1080", 1080),   # V2Ray/SS common
+        ("http://127.0.0.1:10809", 10809), # V2Ray default
+        ("socks5://127.0.0.1:7891", 7891), # Clash SOCKS5
+        ("socks5://127.0.0.1:1080", 1080), # SS SOCKS5
+    ]
+    for proxy_url, port in common_proxies:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            s.connect(("127.0.0.1", port))
+            s.close()
+            os.environ["HTTP_PROXY"] = proxy_url
+            os.environ["HTTPS_PROXY"] = proxy_url
+            os.environ["ALL_PROXY"] = proxy_url
+            os.environ["WS_PROXY"] = proxy_url
+            os.environ["WSS_PROXY"] = proxy_url
+            print(f"[Proxy] Detected local proxy: {proxy_url}", flush=True)
+            return proxy_url
+        except (socket.timeout, ConnectionRefusedError, OSError) as e:
+            print(f"[Proxy] Port {port}: {e}", flush=True)
+            continue
+    print("[Proxy] No local proxy detected", flush=True)
+    return None
+
+
 def _get_longport_ctx():
     """Get or create Longport QuoteContext (lazy init)."""
     global _longport_ctx
@@ -228,16 +258,25 @@ def _get_longport_ctx():
     access_token = creds.get("access_token", "")
 
     if not all([app_key, app_secret, access_token]):
+        print("[Longport] No credentials configured", file=sys.stderr)
         return None
 
+    # Auto-detect proxy for Clash/V2Ray users
+    _detect_proxy()
+
+    # Set region for China mainland (SDK auto-selects .cn endpoints)
+    os.environ.setdefault("LONGBRIDGE_REGION", "cn")
+
     try:
-        from longport.openapi import Config, QuoteContext
-        config = Config(
-            app_key=app_key,
-            app_secret=app_secret,
-            access_token=access_token,
+        from longbridge.openapi import Config, QuoteContext
+        config = Config.from_apikey(
+            app_key,
+            app_secret,
+            access_token,
+            enable_overnight=True,
         )
         _longport_ctx = QuoteContext(config)
+        print("[Longport] Connected successfully", flush=True)
         return _longport_ctx
     except Exception as e:
         print(f"[Longport Error] {e}", file=sys.stderr)
@@ -263,7 +302,6 @@ def _longport_fetch_us(codes: list[str]) -> dict:
         code_map[symbol] = c
 
     try:
-        from longport.openapi import QuoteType
         quotes = ctx.quote(symbols)
     except Exception as e:
         print(f"[Longport Quote Error] {e}", file=sys.stderr)
@@ -283,28 +321,26 @@ def _longport_fetch_us(codes: list[str]) -> dict:
                 "change_pct": change_pct,
             }
 
-            # Overnight / pre / post market
+            # Overnight / pre / post market (SDK fields: overnight_quote, pre_market_quote, post_market_quote)
             extra = {}
-            if hasattr(q, "overnight") and q.overnight:
-                oh = q.overnight
-                oh_price = float(oh.last_done) if hasattr(oh, "last_done") else float(oh.price)
+            if hasattr(q, "overnight_quote") and q.overnight_quote:
+                oh = q.overnight_quote
+                oh_price = float(oh.last_done)
                 oh_prev = float(oh.prev_close)
-                extra["ah_price"] = oh_price
-                extra["ah_pct"] = (oh_price - oh_prev) / oh_prev * 100 if oh_prev else 0
-                extra["ah_time"] = "overnight"
-            if hasattr(q, "pre_market") and q.pre_market:
-                pm = q.pre_market
-                pm_price = float(pm.last_done) if hasattr(pm, "last_done") else float(pm.price)
+                extra["on_price"] = oh_price
+                extra["on_pct"] = (oh_price - oh_prev) / oh_prev * 100 if oh_prev else 0
+            if hasattr(q, "pre_market_quote") and q.pre_market_quote:
+                pm = q.pre_market_quote
+                pm_price = float(pm.last_done)
                 pm_prev = float(pm.prev_close)
                 extra["pm_price"] = pm_price
                 extra["pm_pct"] = (pm_price - pm_prev) / pm_prev * 100 if pm_prev else 0
-            if hasattr(q, "post_market") and q.post_market:
-                pt = q.post_market
-                pt_price = float(pt.last_done) if hasattr(pt, "last_done") else float(pt.price)
+            if hasattr(q, "post_market_quote") and q.post_market_quote:
+                pt = q.post_market_quote
+                pt_price = float(pt.last_done)
                 pt_prev = float(pt.prev_close)
                 extra["ah_price"] = pt_price
                 extra["ah_pct"] = (pt_price - pt_prev) / pt_prev * 100 if pt_prev else 0
-                extra["ah_time"] = "post_market"
 
             if extra:
                 entry["extra"] = extra
@@ -319,6 +355,34 @@ def format_pct(pct: float) -> str:
     """Format percentage with sign."""
     sign = "+" if pct >= 0 else ""
     return f"{sign}{pct:.2f}%"
+
+
+def _active_us_session() -> str:
+    """Determine which US stock session is currently active (Shanghai time UTC+8).
+
+    US sessions in HKT (EDT, Mar-Nov):
+        Overnight:  08:00 - 16:00
+        Pre-market: 16:00 - 21:30
+        Regular:    21:30 - 04:00 (next day)
+        Post-market: 04:00 - 08:00
+
+    US sessions in HKT (EST, Nov-Mar):
+        Overnight:  09:00 - 17:00
+        Pre-market: 17:00 - 22:30
+        Regular:    22:30 - 05:00 (next day)
+        Post-market: 05:00 - 09:00
+    """
+    from datetime import datetime
+    now = datetime.now()
+    h, m = now.hour, now.minute
+    t = h * 60 + m
+
+    # EDT schedule (current: Aug 2026)
+    if 480 <= t < 960:    return "overnight"   # 08:00–16:00
+    if 960 <= t < 1290:   return "pre_market"  # 16:00–21:30
+    if t >= 1290 or t < 240: return "regular"  # 21:30–04:00
+    if 240 <= t < 480:    return "post_market" # 04:00–08:00
+    return ""
 
 
 # ── Main Application ──────────────────────────────────────────────
@@ -630,18 +694,28 @@ class FishMonitor:
                 info = data[code]
                 pct = info["change_pct"]
                 text = format_pct(pct)
-                # US stocks: append pre/post market data if enabled
-                if self.config.get("show_extended_hours", True):
+                # US stocks only: show whichever session is currently active
+                if self.config.get("show_extended_hours", True) and code.startswith("gb_"):
                     extra = info.get("extra", {})
-                    if extra:
-                        ah_pct = extra.get("ah_pct")
-                        pm_pct = extra.get("pm_pct")
-                        ah_time = extra.get("ah_time", "")
-                        if pm_pct is not None:
-                            text += f"  PM {format_pct(pm_pct)}"
-                        elif ah_pct is not None:
-                            label = "夜盘" if ah_time == "overnight" else "AH"
-                            text += f"  {label} {format_pct(ah_pct)}"
+                    session = _active_us_session()
+                    on_pct = extra.get("on_pct") if extra else None
+                    pm_pct = extra.get("pm_pct") if extra else None
+                    ah_pct = extra.get("ah_pct") if extra else None
+                    if session == "overnight":
+                        # 夜盘优先用夜盘数据，没有就用盘后数据兜底
+                        pct_val = on_pct if on_pct is not None else ah_pct
+                        label = "夜盘"
+                    elif session == "pre_market":
+                        pct_val = pm_pct
+                        label = "盘前"
+                    elif session == "post_market":
+                        pct_val = ah_pct
+                        label = "盘后"
+                    else:
+                        pct_val = None
+                        label = ""
+                    if label:
+                        text = f"{label} {format_pct(pct_val)}" if pct_val is not None else f"{label} --%"
                 self.labels[code].config(text=text)
 
     # ── Run ────────────────────────────────────────────────────────
