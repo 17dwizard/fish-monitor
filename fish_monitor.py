@@ -18,7 +18,11 @@ from tkinter import simpledialog, messagebox
 APP_NAME = "Fish Monitor"
 VERSION = "1.0.0"
 CONFIG_FILE = Path(__file__).parent / "config.json"
-TRANSPARENT_KEY = "#f0f0f0"  # Windows transparent color key
+TRANSPARENT_KEY = "#101010"  # Windows transparent color key — kept CLOSE to the text
+# color on purpose: the color-key technique leaves anti-aliasing transition
+# pixels (blend of text color and key color) visible, so a light key produces
+# a bright halo around glyphs. With a near-black key those transition pixels
+# blend toward the glyph itself and the halo disappears.
 REFRESH_INTERVAL = 10  # seconds
 
 # ── Default Config ─────────────────────────────────────────────────
@@ -29,6 +33,7 @@ DEFAULT_CONFIG = {
     "opacity": 0.88,
     "position": None,  # {x, y} or None = center
     "font_size": 11,
+    "text_color": "#000000",  # use "#ffffff" on dark desktops
     "refresh_interval": 10,
 }
 
@@ -70,7 +75,16 @@ except ImportError:
     HAS_PIL = False
     Image = ImageDraw = ImageFont = ImageTk = None
 
-_KEY_RGB = (240, 240, 240)  # must match TRANSPARENT_KEY (#f0f0f0)
+_KEY_RGB = (16, 16, 16)  # must match TRANSPARENT_KEY (#101010)
+
+
+def _parse_color(value, fallback=(0, 0, 0)):
+    """Parse '#rrggbb' into an RGB tuple."""
+    try:
+        s = value.lstrip("#")
+        return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+    except Exception:
+        return fallback
 
 
 def _dpi_scale_of(widget) -> float:
@@ -101,6 +115,9 @@ class TextRenderer:
     def __init__(self, config, dpi_scale: float = 1.0):
         pt = config.get("font_size", 11)
         self.px = max(8, int(round(pt * 4 / 3 * dpi_scale)))
+        text_rgb = _parse_color(config.get("text_color", "#000000"))
+        # text color must differ from the transparent key, or glyphs go invisible
+        self._text_rgb = (0, 0, 0) if text_rgb == _KEY_RGB else text_rgb
         size = self.px * self._S
         self._f_num = self._load_font(
             config.get("number_font", "ChakraPetch-Bold.ttf"),
@@ -150,7 +167,7 @@ class TextRenderer:
         x = float(S)
         for kind, seg in runs:
             f = self._f_cjk if kind == "cjk" else self._f_num
-            d.text((x, self._baseline), seg, font=f, fill=(0, 0, 0, 255), anchor="ls")
+            d.text((x, self._baseline), seg, font=f, fill=self._text_rgb + (255,), anchor="ls")
             x += d.textlength(seg, font=f)
         base = Image.new("RGBA", layer.size, _KEY_RGB + (255,))
         out = Image.alpha_composite(base, layer)
@@ -608,7 +625,7 @@ class FishMonitor:
                 self.labels_frame,
                 text="加载中...",
                 font=("Consolas", self.config.get("font_size", 11), "bold"),
-                fg="#000000",
+                fg=self.config.get("text_color", "#000000"),
                 bg=TRANSPARENT_KEY,
                 anchor="w",
             )
