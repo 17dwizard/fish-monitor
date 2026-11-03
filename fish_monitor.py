@@ -57,6 +57,107 @@ def save_config(cfg):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
+# ── Anti-aliased Text Rendering (Pillow) ───────────────────────────
+# GDI text via tk.Label has no anti-aliasing and looks flat. Instead we
+# render text with Pillow (2x supersampled, LANCZOS downscale) onto the
+# transparent-key color and display it as a label image.
+FONTS_DIR = Path(__file__).parent / "fonts"
+
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+    Image = ImageDraw = ImageFont = ImageTk = None
+
+_KEY_RGB = (240, 240, 240)  # must match TRANSPARENT_KEY (#f0f0f0)
+
+
+def _dpi_scale_of(widget) -> float:
+    """DPI scale factor of the widget's display (1.0 = 96 DPI)."""
+    try:
+        return float(widget.winfo_fpixels("1i")) / 96.0
+    except Exception:
+        return 1.0
+
+
+def _split_runs(text: str):
+    """Split text into ('num', seg) / ('cjk', seg) runs for per-script fonts."""
+    runs = []
+    for ch in text:
+        kind = "cjk" if ord(ch) > 0x2E80 else "num"
+        if runs and runs[-1][0] == kind:
+            runs[-1][1] += ch
+        else:
+            runs.append([kind, ch])
+    return runs
+
+
+class TextRenderer:
+    """Render label text with Pillow onto the transparent-key background."""
+
+    _S = 2  # supersample factor
+
+    def __init__(self, config, dpi_scale: float = 1.0):
+        pt = config.get("font_size", 11)
+        self.px = max(8, int(round(pt * 4 / 3 * dpi_scale)))
+        size = self.px * self._S
+        self._f_num = self._load_font(
+            config.get("number_font", "ChakraPetch-Bold.ttf"),
+            ["C:/Windows/Fonts/consolab.ttf", "C:/Windows/Fonts/arialbd.ttf"],
+            size,
+        )
+        self._f_cjk = self._load_font(
+            config.get("cjk_font", "NotoSansSC.ttf"),
+            ["C:/Windows/Fonts/msyhbd.ttc", "C:/Windows/Fonts/msyh.ttc"],
+            size,
+            variation="Medium",
+        )
+        if self._f_num is None or self._f_cjk is None:
+            raise RuntimeError("no usable fonts found")
+        # Shared baseline so mixed CJK/Latin runs sit level
+        asc_n, desc_n = self._f_num.getmetrics()
+        asc_c, desc_c = self._f_cjk.getmetrics()
+        self._baseline = max(asc_n, asc_c) + self._S * 2
+        self._height = self._baseline + max(desc_n, desc_c) + self._S * 2
+
+    @staticmethod
+    def _load_font(filename, fallbacks, size, variation=None):
+        candidates = [FONTS_DIR / filename] + [Path(p) for p in fallbacks]
+        for path in candidates:
+            try:
+                font = ImageFont.truetype(str(path), size)
+                if variation:
+                    try:
+                        font.set_variation_by_name(variation)
+                    except Exception:
+                        pass
+                return font
+            except Exception:
+                continue
+        return None
+
+    def render(self, text: str):
+        """Return an ImageTk.PhotoImage of anti-aliased text (caller keeps ref)."""
+        S = self._S
+        tmp = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+        runs = _split_runs(text)
+        width = sum(tmp.textlength(seg, font=(self._f_cjk if k == "cjk" else self._f_num))
+                    for k, seg in runs)
+        w = int(width) + 2 * S
+        layer = Image.new("RGBA", (w, self._height), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        x = float(S)
+        for kind, seg in runs:
+            f = self._f_cjk if kind == "cjk" else self._f_num
+            d.text((x, self._baseline), seg, font=f, fill=(0, 0, 0, 255), anchor="ls")
+            x += d.textlength(seg, font=f)
+        base = Image.new("RGBA", layer.size, _KEY_RGB + (255,))
+        out = Image.alpha_composite(base, layer)
+        out = out.resize((max(1, w // S), max(1, self._height // S)), Image.LANCZOS)
+        return ImageTk.PhotoImage(out)
+
+
 # ── Data Sources (Hybrid: Sina for A/US, Tencent for HK) ──────────
 import urllib.request
 
@@ -422,6 +523,11 @@ class FishMonitor:
         self.running = True
         self.visible = True
 
+        # Text rendering state (Pillow-based, see TextRenderer)
+        self._renderer = None
+        self._renderer_key = None
+        self._photos = {}  # keep PhotoImage refs alive (GC guard)
+
         # Build UI
         self._build_root()
         self._build_labels()
@@ -437,11 +543,29 @@ class FishMonitor:
 
     def _build_root(self):
         """Create the main transparent window."""
+        # DPI awareness must be set before the Tk window exists, otherwise
+        # Windows bitmap-stretches everything and text renders blurry.
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                try:
+                    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor
+                except Exception:
+                    ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
         self.root = tk.Tk()
         self.root.title(APP_NAME)
         self.root.overrideredirect(True)  # No title bar
         self.root.attributes("-topmost", True)  # Always on top
         self.root.attributes("-alpha", self.config.get("opacity", 0.88))
+
+        # DPI scale for crisp Pillow text rendering (physical px per logical px)
+        try:
+            self._dpi_scale = float(self.root.winfo_fpixels("1i")) / 96.0
+        except Exception:
+            self._dpi_scale = 1.0
 
         # Windows transparent color trick
         if sys.platform == "win32":
@@ -454,9 +578,9 @@ class FishMonitor:
         if pos:
             self.root.geometry(f"+{pos['x']}+{pos['y']}")
         else:
-            # Center on screen
+            # Center on screen (scale with DPI — geometry is physical pixels)
             self.root.update_idletasks()
-            w, h = 300, 60
+            w, h = int(300 * self._dpi_scale), int(60 * self._dpi_scale)
             x = (self.root.winfo_screenwidth() - w) // 2
             y = (self.root.winfo_screenheight() - h) // 4
             self.root.geometry(f"{w}x{h}+{x}+{y}")
@@ -494,6 +618,7 @@ class FishMonitor:
             lbl.bind("<B1-Motion>", self._on_drag)
             lbl.bind("<Button-3>", self._on_right_click)
             self.labels[code] = lbl
+            self._set_label(code, "加载中...")
 
     def _build_context_menu(self):
         """Build right-click context menu (custom popup, not tk.Menu)."""
@@ -746,7 +871,34 @@ class FishMonitor:
                         label = ""
                     if label:
                         text = f"{label} {format_pct(pct_val)}" if pct_val is not None else f"{label} --%"
-                self.labels[code].config(text=text)
+                self._set_label(code, text)
+
+    def _get_renderer(self):
+        """Get (or rebuild) the Pillow text renderer; None falls back to GDI text."""
+        if not HAS_PIL:
+            return None
+        want = (self.config.get("font_size", 11), round(getattr(self, "_dpi_scale", 1.0), 2))
+        if self._renderer is None or self._renderer_key != want:
+            try:
+                self._renderer = TextRenderer(self.config, getattr(self, "_dpi_scale", 1.0))
+            except Exception as e:
+                print(f"[Font] renderer unavailable, falling back to GDI text: {e}", file=sys.stderr)
+                self._renderer = None
+            self._renderer_key = want
+        return self._renderer
+
+    def _set_label(self, code: str, text: str):
+        """Update a label with Pillow-rendered text (or plain GDI text fallback)."""
+        lbl = self.labels.get(code)
+        if lbl is None:
+            return
+        renderer = self._get_renderer()
+        if renderer is not None:
+            photo = renderer.render(text)
+            self._photos[code] = photo  # prevent GC of the PhotoImage
+            lbl.config(image=photo, text="")
+        else:
+            lbl.config(text=text)
 
     # ── Run ────────────────────────────────────────────────────────
 
@@ -767,7 +919,6 @@ class SettingsDialog:
         # Create dialog window
         self.win = tk.Toplevel(parent)
         self.win.title("Settings — Fish Monitor")
-        self.win.geometry("420x620")
         self.win.resizable(False, False)
         self.win.attributes("-topmost", True)
 
@@ -776,6 +927,17 @@ class SettingsDialog:
         self.win.grab_set()
 
         self._build_ui()
+
+        # Size to content. Fixed pixel geometry clips on high-DPI displays:
+        # tk fonts scale with the real DPI (process is DPI-aware) but a
+        # geometry string like "420x620" is physical pixels. Scale the design
+        # size and never go below what the content actually requests.
+        self.win.update_idletasks()
+        s = _dpi_scale_of(self.win)
+        w = max(int(420 * s), self.win.winfo_reqwidth())
+        h = max(int(620 * s), self.win.winfo_reqheight())
+        self.win.geometry(f"{w}x{h}")
+
         self.win.wait_window()
 
     def _build_ui(self):
