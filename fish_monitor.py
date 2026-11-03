@@ -357,32 +357,62 @@ def format_pct(pct: float) -> str:
     return f"{sign}{pct:.2f}%"
 
 
+def _nth_weekday(year: int, month: int, weekday: int, n: int):
+    """Return the n-th given weekday (Mon=0..Sun=6) of a month as a datetime."""
+    from datetime import datetime, timedelta
+    d = datetime(year, month, 1)
+    offset = (weekday - d.weekday()) % 7
+    return d + timedelta(days=offset + 7 * (n - 1))
+
+
+def _us_is_edt(now_utc=None) -> bool:
+    """Is US Eastern currently in daylight saving time (EDT)?
+
+    US DST rules (since 2007): 2nd Sunday of March 02:00 EST -> 1st Sunday of
+    November 02:00 EDT. Compared in UTC (07:00 / 06:00) to stay unambiguous.
+    """
+    from datetime import datetime, timezone
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    year = now_utc.year
+    dst_start = _nth_weekday(year, 3, 6, 2).replace(hour=7, tzinfo=timezone.utc)   # 2nd Sun Mar 07:00 UTC
+    dst_end = _nth_weekday(year, 11, 6, 1).replace(hour=6, tzinfo=timezone.utc)     # 1st Sun Nov 06:00 UTC
+    return dst_start <= now_utc < dst_end
+
+
 def _active_us_session() -> str:
     """Determine which US stock session is currently active (Shanghai time UTC+8).
 
-    US sessions in HKT (EDT, Mar-Nov):
+    US sessions in Beijing time (EDT, ~Mar-Nov):
         Overnight:  08:00 - 16:00
         Pre-market: 16:00 - 21:30
         Regular:    21:30 - 04:00 (next day)
         Post-market: 04:00 - 08:00
 
-    US sessions in HKT (EST, Nov-Mar):
+    US sessions in Beijing time (EST, ~Nov-Mar):
         Overnight:  09:00 - 17:00
         Pre-market: 17:00 - 22:30
         Regular:    22:30 - 05:00 (next day)
         Post-market: 05:00 - 09:00
+
+    DST is auto-detected via _us_is_edt(), so the schedule flips correctly
+    on transition days instead of being hardcoded to one season.
     """
     from datetime import datetime
     now = datetime.now()
-    h, m = now.hour, now.minute
-    t = h * 60 + m
+    t = now.hour * 60 + now.minute
 
-    # EDT schedule (current: Aug 2026)
-    if 480 <= t < 960:    return "overnight"   # 08:00–16:00
-    if 960 <= t < 1290:   return "pre_market"  # 16:00–21:30
-    if t >= 1290 or t < 240: return "regular"  # 21:30–04:00
-    if 240 <= t < 480:    return "post_market" # 04:00–08:00
-    return ""
+    if _us_is_edt():
+        # EDT schedule
+        if 480 <= t < 960:    return "overnight"   # 08:00–16:00
+        if 960 <= t < 1290:   return "pre_market"  # 16:00–21:30
+        if t >= 1290 or t < 240: return "regular"  # 21:30–04:00
+        return "post_market"                       # 04:00–08:00
+    # EST schedule
+    if 540 <= t < 1020:   return "overnight"       # 09:00–17:00
+    if 1020 <= t < 1350:  return "pre_market"      # 17:00–22:30
+    if t >= 1350 or t < 300: return "regular"      # 22:30–05:00
+    return "post_market"                           # 05:00–09:00
 
 
 # ── Main Application ──────────────────────────────────────────────
